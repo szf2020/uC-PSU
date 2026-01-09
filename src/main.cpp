@@ -6,43 +6,115 @@
 #include ".config.hpp"
 #include "assert.hpp"
 #include "esp32-hal-adc-hack.hpp"
+#include "interpoly.hpp"
+#include "preferences.hpp"
+
+Preferences preferences;
 
 bool on = true;
 
-auto pmap(double v, const std::initializer_list<double> &poly) {
-  double x = 1.0, result = 0.0;
-  for (auto it = std::rbegin(poly); it != std::rend(poly); ++it) {
-    result += *it * x;
-    x *= v;
+inline static const std::string POLY_SUFFIX{"-poly"};
+struct Pin {
+  const uint8_t pin;
+  const char *key;
+  PolyXY poly;
+  Pin(uint8_t pin, const char *key) : pin(pin), key(key) {}
+  void begin(Preferences &preferences) {
+    loadPoly(poly, (key + POLY_SUFFIX).c_str(), preferences);
+    Serial.printf("LOADED: %s:", key);
+    for (const auto &[x, y] : poly) {
+      Serial.printf(" %d=%d", x, y);
+    }
+    Serial.println();
   }
-  return result;
-}
+  void calibrateDone() { CHECK_VA(storePoly(poly, (key + POLY_SUFFIX).c_str(), preferences), key); }
+  void calibrateSet(uint16_t duty, float value) {
+    const auto &item = poly.emplace_back(duty, (int16_t)(value * 1e3f));
+    Serial.printf("CALIBRATE: %s %d %d=%d\n", key, poly.size(), item.first, item.second);
+    std::sort(poly.begin(), poly.end());
+  }
+  uint16_t calibrateNext(float threshold) {
+    switch (poly.size()) {
+    case 0:
+      return 1024;
+    case 1:
+      return 0;
+    case 2:
+      return (poly[0].first + poly[1].first) / 2;
+    }
+    const int32_t thresh = threshold * 1e3f;
+    bool pf = false;
+    for (size_t i = 2; i < poly.size(); ++i) {
+      const auto &c = poly[i], &p = poly[i - 1], &pp = poly[i - 2];
+      const auto xv = lerpi(p.first, c, pp, F2S), v = p.second;
+      const auto e = abs(1000 - (int)v * 1000 / xv);
+      if (e < 10) {
+        pf = false;
+        continue;
+      }
+      if (pf)
+        return (p.first + pp.first) / 2;
+      pf = max(c.second, p.second) > thresh;
+      if ((i == 2) && (max(p.second, pp.second) > thresh))
+        return (p.first + pp.first) / 2;
+    }
+    const auto &c = poly.back(), &p = *(poly.rbegin() + 1);
+    if (pf and (max(c.second, p.second) > thresh))
+      return (c.first + p.first) / 2;
+    return 0xFFFF;
+  }
+};
+struct PinPwm : Pin {
+  using Base = Pin;
+  const Order order;
+  float value;
+  uint16_t duty;
+  PinPwm(uint8_t pin, const char *key, const Order &order) : Base(pin, key), order(order) {}
+  bool begin(Preferences &preferences) {
+    Base::begin(preferences);
+    if (!ledcAttach(pin, 39138, 10))
+      return false;
+    setValue(0);
+    return true;
+  }
+  void setValue(float v) {
+    value = v;
+    const auto mv = on ? (int16_t)(v * 1e3f) : 0;
+    setDuty(interpoly(mv, poly, S2F, order));
+  }
+  void restoreValue() { setValue(value); }
+  void setDuty(int16_t v) {
+    duty = constrain(v, 0, 1024);
+    Serial.printf("PWM: %s=%d\n", key, duty);
+    CHECK_VA(ledcWrite(pin, duty), "(%d,%d)", pin, duty);
+  }
+  bool calibrate(const std::string &rest, float threshold) {
+    if (rest == "DONE") {
+      calibrateDone();
+      restoreValue();
+      return false;
+    }
+    if (rest == "RESTART") {
+      poly.clear();
+    } else if (rest != "CONTINUE") {
+      calibrateSet(duty, std::stof(rest));
+    }
+    if (const auto nd = calibrateNext(threshold); nd != 0xFFFF)
+      setDuty(nd);
+    else {
+      Serial.printf("CALIBRATED: %d\n", poly.size());
+      return false;
+    }
+    return true;
+  }
+} pwm_v(10, "pwm-mv", DESC), pwm_a(20, "pwm-ma", ASC);
 
-void set(uint8_t pin, float v, const std::initializer_list<double> &poly) {
-  const auto pwm = (int)constrain(pmap(v, poly), 0, 1024);
-  Serial.printf("PWM: %d=%d(%f)\n", pin, pwm, v);
-  CHECK_VA(ledcWrite(pin, pwm), "(%d,%d)", pin, pwm);
-}
-
-#define PIN_PWM_V 10
-float set_v = 0;
-
-void setVoltage(float v) {
-  set_v = v;
-  set(PIN_PWM_V, on ? v : 0.f, {-3.77264919e-02, 9.84725460e-01, -9.29032821e+01, 8.00313668e+02});
-}
-
-#define PIN_PWM_I 20
-float set_i = 0;
-void setCurrent(float v) {
-  set_i = v;
-  set(PIN_PWM_I, v, {268.5754725, -0.91707882});
-}
-
-#define PIN_ADC_I 4
-float avg_i = 0;
-#define PIN_ADC_V 3
-float avg_v = 0;
+struct PinAdc : Pin {
+  using Base = Pin;
+  float avg;
+  PinAdc(uint8_t pin, const char *key) : Base(pin, key) {}
+  float getValue() const { return interpoly((int16_t)(avg * 8), poly, F2S, ASC) / 1e3f; }
+} adc_v(3, "adc-mv"), adc_a(4, "adc-ma");
 
 struct : public AsyncServer {
   using AsyncServer::_port;
@@ -56,17 +128,10 @@ std::string ff3n(float f) {
 std::initializer_list<std::pair<std::string, std::function<std::string(const std::string &suffix)>>> COMMANDS{
     {"*IDN?\n", [](const auto &) { return "igelbox,EPS1,0,0.1\n"; }},
     {"OUTPUT:CVCC? CH1\n", [](const auto &) { return "CV\n"; }}, // TODO
-    {"MEASURE:VOLTAGE? CH1\n",
-     [](const auto &) {
-       return ff3n(pmap(avg_v, {1.26900834e-14, -8.12377947e-11, 1.81774135e-07, 4.32187213e-03, -6.37734292e-01}));
-     }},
-    {"SOURCE1:VOLTAGE?\n", [](const auto &) { return ff3n(set_v); }},
-    {"MEASURE:CURRENT? CH1\n",
-     [](const auto &) {
-       return ff3n(pmap(avg_i, {1.53524393e-18, -4.16563790e-15, 4.28800185e-12, -2.12585388e-09, 5.39631775e-07,
-                                -7.03940880e-05, 8.52150124e-03, -4.70666463e-02}));
-     }},
-    {"SOURCE1:CURRENT?\n", [](const auto &) { return ff3n(set_i); }},
+    {"MEASURE:VOLTAGE? CH1\n", [](const auto &) { return ff3n(adc_v.getValue()); }},
+    {"SOURCE1:VOLTAGE?\n", [](const auto &) { return ff3n(pwm_v.value); }},
+    {"MEASURE:CURRENT? CH1\n", [](const auto &) { return ff3n(adc_a.getValue()); }},
+    {"SOURCE1:CURRENT?\n", [](const auto &) { return ff3n(pwm_a.value); }},
 
     // TODO
     {"SOURCE1:CURRENT:PROTECTION:STATE?\n", [](const auto &) { return "OFF\n"; }},
@@ -77,37 +142,55 @@ std::initializer_list<std::pair<std::string, std::function<std::string(const std
     {"OUTPUT CH1,",
      [](const auto &rest) {
        on = rest == "ON";
-       setVoltage(set_v);
+       pwm_v.restoreValue();
+       pwm_a.restoreValue();
        return "";
      }},
     {"SOURCE1:VOLTAGE ",
      [](const auto &rest) {
-       setVoltage(std::stof(rest));
+       pwm_v.setValue(std::stof(rest));
        return "";
      }},
     {"SOURCE1:CURRENT ",
      [](const auto &rest) {
-       setCurrent(std::stof(rest));
+       pwm_a.setValue(std::stof(rest));
+       return "";
+     }},
+
+    {"CALIBRATE:OUTPUT:VOLTAGE CH1,",
+     [](const auto &rest) {
+       if (pwm_v.calibrate(rest, 1 /*1.25 is XL4015 lower reliable bound*/))
+         pwm_a.setDuty(1024 /*unlimited*/);
+       else
+         pwm_a.restoreValue();
+       return "";
+     }},
+    {"CALIBRATE:OUTPUT:CURRENT CH1,",
+     [](const auto &rest) {
+       if (pwm_a.calibrate(rest, 0))
+         pwm_v.setDuty(0 /*unlimited*/);
+       else
+         pwm_v.restoreValue();
        return "";
      }},
 };
 
 void setup() {
-  pinMode(PIN_PWM_V, OUTPUT);
-  digitalWrite(PIN_PWM_V, HIGH);
+  pinMode(pwm_v.pin, OUTPUT);
+  digitalWrite(pwm_v.pin, HIGH);
 
   setCpuFrequencyMhz(80); // reduce heating a bit
   delay(500);             // give a time to connect monitor
   Serial.begin(115200);
 
-  for (const auto pin : std::initializer_list<int>{PIN_PWM_V, PIN_PWM_I}) {
-    ASSERT_VA(ledcAttach(pin, 39138, 10), "(%d)", pin);
-    pin == PIN_PWM_V ? setVoltage(0) : setCurrent(0);
-  }
-
+  ASSERT(preferences.begin("epsu"));
+  for (const auto pwm : {&pwm_v, &pwm_a})
+    ASSERT_VA(pwm->begin(preferences), "(%d)", pwm->pin);
+  for (const auto adc : {&adc_v, &adc_a})
+    adc->begin(preferences);
   {
     analogContinuousSetAtten(ADC_0db);
-    uint8_t pins[2] = {PIN_ADC_V, PIN_ADC_I};
+    uint8_t pins[2] = {adc_v.pin, adc_a.pin};
     ASSERT(analogContinuous(pins, 2, 4092 / 2 / SOC_ADC_DIGI_RESULT_BYTES, 1024, nullptr));
     ASSERT(analogContinuousStart());
   }
@@ -116,7 +199,7 @@ void setup() {
     Serial.print(s);
     delay(1000);
   }
-  WiFi.setTxPower(WIFI_POWER_2dBm);
+  CHECK(WiFi.setTxPower(WIFI_POWER_2dBm));
   Serial.printf("TxPower: %d\n", WiFi.getTxPower());
   Serial.print("IP Address: ");
   Serial.println(WiFi.localIP());
@@ -203,14 +286,11 @@ void setup() {
 void loop() {
   adc_continuous_results_t results;
   if (CHECK(analogContinuousReadSumCount(results, 1000))) {
-    for (const auto [pin, avg] : std::initializer_list<std::pair<uint8_t, float &>>{
-             {PIN_ADC_V, avg_v},
-             {PIN_ADC_I, avg_i},
-         }) {
-      const auto &result = results[digitalPinToAnalogChannel(pin)];
+    for (const auto adc : {&adc_v, &adc_a}) {
+      const auto &result = results[digitalPinToAnalogChannel(adc->pin)];
       // Serial.printf("%d\t%d\t%d\t%d\n", pin, digitalPinToAnalogChannel(pin), result.count, result.sum_read_raw);
-      avg = (float)result.sum_read_raw / (float)result.count;
+      adc->avg = (float)result.sum_read_raw / (float)result.count;
     }
-    Serial.printf("%d: u=%f\ti=%f\n", millis(), avg_v, avg_i);
+    Serial.printf("%d: u=%f\ti=%f\n", millis(), adc_v.avg, adc_a.avg);
   }
 }
