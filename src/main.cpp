@@ -22,8 +22,11 @@ inline static const std::string POLY_SUFFIX{"-poly"};
 struct Pin {
   const uint8_t pin;
   const char *key;
+  const int16_t threshold;
+  const bool reversed;
   PolyXY poly;
-  Pin(uint8_t pin, const char *key) : pin(pin), key(key) {}
+  Pin(uint8_t pin, const char *key, int16_t threshold, bool reversed = false)
+      : pin(pin), key(key), threshold(threshold), reversed(reversed) {}
   void begin(Preferences &preferences) {
     loadPoly(poly, (key + POLY_SUFFIX).c_str(), preferences);
     Serial.printf("LOADED: %s:", key);
@@ -35,48 +38,54 @@ struct Pin {
   void calibrateDone() { CHECK_VA(storePoly(poly, (key + POLY_SUFFIX).c_str(), preferences), key); }
   void calibrateSet(uint16_t duty, int16_t value) {
     const auto &item = poly.emplace_back(duty, value);
-    Serial.printf("CALIBRATE: %s %d %d=%d\n", key, poly.size(), item.first, item.second);
+    // Serial.printf("CALIBRATE: %s %d %d=%d\n", key, poly.size(), item.first, item.second);
     std::sort(poly.begin(), poly.end());
   }
-  uint16_t calibrateNext(float threshold) {
+  uint16_t calibrateNext() {
     switch (poly.size()) {
     case 0:
-      return 1024;
+      return 512;
     case 1:
       return 0;
     case 2:
-      return (poly[0].first + poly[1].first) / 2;
+      return 1024;
     }
-    const int32_t thresh = threshold * 1e3f;
+    struct {
+      uint16_t v = 0xFFFF;
+      float score = 0;
+      void consider(float e, int16_t a, int16_t b) {
+        const auto m = mid_or_0(a, b);
+        if (!m)
+          return;
+        if (const auto s = e * abs(b - a); s > score) {
+          score = s;
+          v = m;
+        }
+      }
+    } best;
     bool pf = false;
+    float e;
     for (size_t i = 2; i < poly.size(); ++i) {
       const auto &c = poly[i], &p = poly[i - 1], &pp = poly[i - 2];
       const auto xv = lerpi(p.first, c, pp, F2S), v = p.second;
-      const auto e = abs(1000 - (int)v * 1000 / xv);
-      if (e < 10) {
-        pf = false;
-        continue;
-      }
-      const auto m = mid_or_0(p.first, pp.first);
-      if (m && pf)
-        return m;
-      pf = max(c.second, p.second) > thresh;
-      if (m && (i == 2) && (max(p.second, pp.second) > thresh))
-        return m;
+      e = abs(1.f - (float)v / xv);
+      if (pf)
+        best.consider(e, p.first, pp.first);
+      pf = max(c.second, p.second) > threshold;
+      if ((i == 2) && (max(p.second, pp.second) > threshold))
+        best.consider(e, p.first, pp.first);
     }
     const auto &c = poly.back(), &p = *(poly.rbegin() + 1);
-    if (pf and (max(c.second, p.second) > thresh))
-      if (const auto m = mid_or_0(c.first, p.first))
-        return m;
-    return 0xFFFF;
+    if (pf and (max(c.second, p.second) > threshold))
+      best.consider(e, c.first, p.first);
+    return best.v;
   }
 };
 struct PinPwm : Pin {
   using Base = Pin;
-  const Order order;
   float value;
   uint16_t duty;
-  PinPwm(uint8_t pin, const char *key, const Order &order) : Base(pin, key), order(order) {}
+  PinPwm(uint8_t pin, const char *key, bool reversed, float threshold) : Base(pin, key, threshold * 1e3f, reversed) {}
   bool begin(Preferences &preferences) {
     Base::begin(preferences);
     if (!ledcAttach(pin, 39138, 10))
@@ -87,7 +96,7 @@ struct PinPwm : Pin {
   void setValue(float v) {
     value = v;
     const auto mv = on ? (int16_t)(v * 1e3f) : 0;
-    setDuty(interpoly(mv, poly, S2F, order, DiscontinuityCheck::USE_LAST_CONTINUOUS));
+    setDuty(interpoly(mv, poly, S2F, reversed ? DESC : ASC, DiscontinuityCheck::USE_LAST_CONTINUOUS));
   }
   void restoreValue() { setValue(value); }
   void setDuty(int16_t v) {
@@ -95,52 +104,41 @@ struct PinPwm : Pin {
     Serial.printf("PWM: %s=%d\n", key, v);
     CHECK_VA(ledcWrite(pin, duty), "(%d,%d)", pin, duty);
   }
-  bool calibrate(const std::string &rest, float threshold) {
-    if (rest == "DONE") {
-      calibrateDone();
-      restoreValue();
-      return false;
-    }
-    if (rest == "RESTART") {
-      poly.clear();
-    } else if (rest != "CONTINUE") {
-      calibrateSet(duty, (int16_t)(std::stof(rest) * 1e3f));
-    }
-    if (const auto nd = calibrateNext(threshold); nd != 0xFFFF)
-      setDuty(nd);
-    else {
-      Serial.printf("CALIBRATED: %s %d\n", key, poly.size());
-      return false;
-    }
-    return true;
-  }
-} pwm_v(10, "pwm-mv", DESC), pwm_a(20, "pwm-ma", ASC);
+  void setDutyUnlimited() { setDuty(reversed ? 0 : 1024); }
+} pwm_v(10, "pwm-mv", true, 1 /*1.25 is XL4015 lower reliable bound*/), pwm_a(20, "pwm-ma", false, 0);
 
 struct PinAdc : Pin {
   static constexpr float K = 8;
   using Base = Pin;
   PinPwm &pwm;
   float avg;
-  PinAdc(uint8_t pin, PinPwm &pwm, const char *key) : Base(pin, key), pwm(pwm) {}
+  PinAdc(uint8_t pin, PinPwm &pwm, const char *key) : Base(pin, key, 0), pwm(pwm) {}
   float getValue() const {
-    const auto duty = interpoly((int16_t)(avg * K), poly, S2F, pwm.order, DiscontinuityCheck::IGNORE);
-    const auto mv = interpoly(duty, pwm.poly, F2S, ASC, DiscontinuityCheck::USE_LAST_CONTINUOUS);
-    // Serial.printf("GV: %s %f -> %d -> %d\n", key, avg, duty, mv);
+    const auto mv = interpoly((int16_t)(avg * K), poly, F2S, ASC, DiscontinuityCheck::USE_LAST_CONTINUOUS);
+    // Serial.printf("GV: %s %f -> %d\n", key, avg, mv);
     return mv / 1e3f;
   }
-} adc_v(3, pwm_v, "pwm-adc-v"), adc_a(4, pwm_a, "pwm-adc-a");
+} adc_v(3, pwm_v, "adc-mv"), adc_a(4, pwm_a, "adc-ma");
 
 struct : public AsyncServer {
   using AsyncServer::_port;
 } server(5555);
 
 static PinAdc *autocalibrate = nullptr;
-static bool dirty = false;
-void restartAutoCalibration(PinAdc &pin) {
-  pin.poly.clear();
-  pin.pwm.setDuty(pin.calibrateNext(0));
-  dirty = true;
-  autocalibrate = &pin;
+static std::vector<float> adcv;
+static float midv, mida;
+void calibrate(PinAdc &adc, const std::string &rest) {
+  auto &pwm = adc.pwm;
+  if (rest == "RESTART") {
+    adc.poly.clear();
+    pwm.poly.clear();
+  } else {
+    midv = std::stof(rest);
+    adcv.clear();
+    autocalibrate = &adc;
+  }
+  if (const auto nd = pwm.calibrateNext(); nd != 0xFFFF)
+    pwm.setDuty(nd);
 }
 
 std::string ff3n(float f) {
@@ -182,31 +180,14 @@ std::initializer_list<std::pair<std::string, std::function<std::string(const std
 
     {"CALIBRATE:OUTPUT:VOLTAGE CH1,",
      [](const auto &rest) {
-       if (pwm_v.calibrate(rest, 1 /*1.25 is XL4015 lower reliable bound*/))
-         pwm_a.setDuty(1024 /*unlimited*/);
-       else
-         pwm_a.restoreValue();
+       pwm_a.setDutyUnlimited();
+       calibrate(adc_v, rest);
        return "";
      }},
     {"CALIBRATE:OUTPUT:CURRENT CH1,",
      [](const auto &rest) {
-       if (pwm_a.calibrate(rest, 0))
-         pwm_v.setDuty(0 /*unlimited*/);
-       else
-         pwm_v.restoreValue();
-       return "";
-     }},
-    {"CALIBRATE:MEASURE:VOLTAGE CH1,AUTO\n",
-     [](const auto &) {
-       pwm_a.setDuty(1024 /*unlimited*/);
-       restartAutoCalibration(adc_v);
-       pwm_v.setDuty(0 /*unlimited */);
-       return "";
-     }},
-    {"CALIBRATE:MEASURE:CURRENT CH1,AUTO\n",
-     [](const auto &) {
-       pwm_v.setDuty(0 /*unlimited */);
-       restartAutoCalibration(adc_a);
+       pwm_v.setDutyUnlimited();
+       calibrate(adc_a, rest);
        return "";
      }},
 };
@@ -320,18 +301,38 @@ void setup() {
 }
 
 void processAutoCalibration(PinAdc &pin) {
-  if (dirty) {
-    dirty = false;
+  adcv.emplace_back(pin.avg);
+  if (adcv.size() == 1) {
+    return; // dirty reading
+  }
+  if (adcv.size() < (13 - (int)log2f(pin.avg))) {
     return;
   }
-  pin.calibrateSet(pin.pwm.duty, (int16_t)(pin.avg * PinAdc::K));
-  if (const auto nd = pin.calibrateNext(0); nd != 0xFFFF) {
-    pin.pwm.setDuty(nd);
-    dirty = true;
+  float avg = 0.f;
+  for (size_t i = 1; i < adcv.size(); ++i) {
+    avg += adcv[i];
+  }
+  avg /= adcv.size() - 1;
+  float v = midv;
+  if (pin.poly.empty()) {
+    mida = avg;
+  } else {
+    v *= avg / mida;
+  }
+  const auto a8 = (int16_t)(avg * PinAdc::K);
+  const auto mv = (int16_t)(v * 1e3f);
+  pin.calibrateSet(a8, mv);
+  auto &pwm = pin.pwm;
+  pwm.calibrateSet(pwm.duty, mv);
+  Serial.printf("CA: %d %d %f\n", pwm.duty, a8, v);
+  if (const auto nd = pwm.calibrateNext(); (nd != 0xFFFF) && (pwm.poly.size() < 16)) {
+    pwm.setDuty(nd);
+    adcv.clear();
     return;
   }
   Serial.printf("CALIBRATED: %s %d\n", pin.key, pin.poly.size());
   pin.calibrateDone();
+  pwm.calibrateDone();
   pwm_a.restoreValue();
   pwm_v.restoreValue();
   autocalibrate = nullptr;
