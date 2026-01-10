@@ -18,7 +18,9 @@ auto lerpi(int16_t x, const XY &a, const XY &b, const Direction &direction) {
       static_cast<int32_t>(x - a.*from) * (b.*to - a.*to) / (b.*from - a.*from) + a.*to);
 }
 
-auto interpoly(int16_t x, const PolyXY &poly, const Direction &direction, const Order &order) {
+enum class DiscontinuityCheck { IGNORE, USE_LAST_CONTINUOUS };
+auto interpoly(int16_t x, const PolyXY &poly, const Direction &direction, const Order &order,
+               const DiscontinuityCheck discontinuity) {
   if (poly.empty())
     return x;
 
@@ -26,7 +28,8 @@ auto interpoly(int16_t x, const PolyXY &poly, const Direction &direction, const 
   const auto &begin = poly.cbegin();
   auto it = begin;
   for (; it != poly.cend(); ++it) {
-    if ((it != begin) && !order(*(it - 1).*from, *it.*from))
+    if ((discontinuity == DiscontinuityCheck::USE_LAST_CONTINUOUS) && (it != begin) &&
+        !order(*(it - 1).*from, *it.*from))
       break; // discountinuity
     if ((it == begin) || order(*it.*from, x))
       continue;

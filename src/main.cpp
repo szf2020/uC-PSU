@@ -13,6 +13,11 @@ Preferences preferences;
 
 bool on = true;
 
+auto mid_or_0(int16_t a, int16_t b) {
+  const auto d = (b - a) / 2, m = a + d;
+  return d && (m != b) ? m : 0;
+}
+
 inline static const std::string POLY_SUFFIX{"-poly"};
 struct Pin {
   const uint8_t pin;
@@ -28,8 +33,8 @@ struct Pin {
     Serial.println();
   }
   void calibrateDone() { CHECK_VA(storePoly(poly, (key + POLY_SUFFIX).c_str(), preferences), key); }
-  void calibrateSet(uint16_t duty, float value) {
-    const auto &item = poly.emplace_back(duty, (int16_t)(value * 1e3f));
+  void calibrateSet(uint16_t duty, int16_t value) {
+    const auto &item = poly.emplace_back(duty, value);
     Serial.printf("CALIBRATE: %s %d %d=%d\n", key, poly.size(), item.first, item.second);
     std::sort(poly.begin(), poly.end());
   }
@@ -52,15 +57,17 @@ struct Pin {
         pf = false;
         continue;
       }
-      if (pf)
-        return (p.first + pp.first) / 2;
+      const auto m = mid_or_0(p.first, pp.first);
+      if (m && pf)
+        return m;
       pf = max(c.second, p.second) > thresh;
-      if ((i == 2) && (max(p.second, pp.second) > thresh))
-        return (p.first + pp.first) / 2;
+      if (m && (i == 2) && (max(p.second, pp.second) > thresh))
+        return m;
     }
     const auto &c = poly.back(), &p = *(poly.rbegin() + 1);
     if (pf and (max(c.second, p.second) > thresh))
-      return (c.first + p.first) / 2;
+      if (const auto m = mid_or_0(c.first, p.first))
+        return m;
     return 0xFFFF;
   }
 };
@@ -80,12 +87,12 @@ struct PinPwm : Pin {
   void setValue(float v) {
     value = v;
     const auto mv = on ? (int16_t)(v * 1e3f) : 0;
-    setDuty(interpoly(mv, poly, S2F, order));
+    setDuty(interpoly(mv, poly, S2F, order, DiscontinuityCheck::USE_LAST_CONTINUOUS));
   }
   void restoreValue() { setValue(value); }
   void setDuty(int16_t v) {
     duty = constrain(v, 0, 1024);
-    Serial.printf("PWM: %s=%d\n", key, duty);
+    Serial.printf("PWM: %s=%d\n", key, v);
     CHECK_VA(ledcWrite(pin, duty), "(%d,%d)", pin, duty);
   }
   bool calibrate(const std::string &rest, float threshold) {
@@ -97,12 +104,12 @@ struct PinPwm : Pin {
     if (rest == "RESTART") {
       poly.clear();
     } else if (rest != "CONTINUE") {
-      calibrateSet(duty, std::stof(rest));
+      calibrateSet(duty, (int16_t)(std::stof(rest) * 1e3f));
     }
     if (const auto nd = calibrateNext(threshold); nd != 0xFFFF)
       setDuty(nd);
     else {
-      Serial.printf("CALIBRATED: %d\n", poly.size());
+      Serial.printf("CALIBRATED: %s %d\n", key, poly.size());
       return false;
     }
     return true;
@@ -110,15 +117,31 @@ struct PinPwm : Pin {
 } pwm_v(10, "pwm-mv", DESC), pwm_a(20, "pwm-ma", ASC);
 
 struct PinAdc : Pin {
+  static constexpr float K = 8;
   using Base = Pin;
+  PinPwm &pwm;
   float avg;
-  PinAdc(uint8_t pin, const char *key) : Base(pin, key) {}
-  float getValue() const { return interpoly((int16_t)(avg * 8), poly, F2S, ASC) / 1e3f; }
-} adc_v(3, "adc-mv"), adc_a(4, "adc-ma");
+  PinAdc(uint8_t pin, PinPwm &pwm, const char *key) : Base(pin, key), pwm(pwm) {}
+  float getValue() const {
+    const auto duty = interpoly((int16_t)(avg * K), poly, S2F, pwm.order, DiscontinuityCheck::IGNORE);
+    const auto mv = interpoly(duty, pwm.poly, F2S, ASC, DiscontinuityCheck::USE_LAST_CONTINUOUS);
+    // Serial.printf("GV: %s %f -> %d -> %d\n", key, avg, duty, mv);
+    return mv / 1e3f;
+  }
+} adc_v(3, pwm_v, "pwm-adc-v"), adc_a(4, pwm_a, "pwm-adc-a");
 
 struct : public AsyncServer {
   using AsyncServer::_port;
 } server(5555);
+
+static PinAdc *autocalibrate = nullptr;
+static bool dirty = false;
+void restartAutoCalibration(PinAdc &pin) {
+  pin.poly.clear();
+  pin.pwm.setDuty(pin.calibrateNext(0));
+  dirty = true;
+  autocalibrate = &pin;
+}
 
 std::string ff3n(float f) {
   char buffer[16];
@@ -171,6 +194,19 @@ std::initializer_list<std::pair<std::string, std::function<std::string(const std
          pwm_v.setDuty(0 /*unlimited*/);
        else
          pwm_v.restoreValue();
+       return "";
+     }},
+    {"CALIBRATE:MEASURE:VOLTAGE CH1,AUTO\n",
+     [](const auto &) {
+       pwm_a.setDuty(1024 /*unlimited*/);
+       restartAutoCalibration(adc_v);
+       pwm_v.setDuty(0 /*unlimited */);
+       return "";
+     }},
+    {"CALIBRATE:MEASURE:CURRENT CH1,AUTO\n",
+     [](const auto &) {
+       pwm_v.setDuty(0 /*unlimited */);
+       restartAutoCalibration(adc_a);
        return "";
      }},
 };
@@ -283,14 +319,35 @@ void setup() {
   Serial.printf("TCP Server started on port %d\n", server._port);
 }
 
+void processAutoCalibration(PinAdc &pin) {
+  if (dirty) {
+    dirty = false;
+    return;
+  }
+  pin.calibrateSet(pin.pwm.duty, (int16_t)(pin.avg * PinAdc::K));
+  if (const auto nd = pin.calibrateNext(0); nd != 0xFFFF) {
+    pin.pwm.setDuty(nd);
+    dirty = true;
+    return;
+  }
+  Serial.printf("CALIBRATED: %s %d\n", pin.key, pin.poly.size());
+  pin.calibrateDone();
+  pwm_a.restoreValue();
+  pwm_v.restoreValue();
+  autocalibrate = nullptr;
+}
+void processAdcResults(const adc_continuous_results_t &results) {
+  for (const auto adc : {&adc_v, &adc_a}) {
+    const auto &result = results[digitalPinToAnalogChannel(adc->pin)];
+    // Serial.printf("%d\t%d\t%d\t%d\n", pin, digitalPinToAnalogChannel(pin), result.count, result.sum_read_raw);
+    adc->avg = (float)result.sum_read_raw / (float)result.count;
+  }
+  Serial.printf("%d: u=%f\ti=%f\n", millis(), adc_v.avg, adc_a.avg);
+  if (const auto pin = autocalibrate)
+    processAutoCalibration(*pin);
+}
 void loop() {
   adc_continuous_results_t results;
-  if (CHECK(analogContinuousReadSumCount(results, 1000))) {
-    for (const auto adc : {&adc_v, &adc_a}) {
-      const auto &result = results[digitalPinToAnalogChannel(adc->pin)];
-      // Serial.printf("%d\t%d\t%d\t%d\n", pin, digitalPinToAnalogChannel(pin), result.count, result.sum_read_raw);
-      adc->avg = (float)result.sum_read_raw / (float)result.count;
-    }
-    Serial.printf("%d: u=%f\ti=%f\n", millis(), adc_v.avg, adc_a.avg);
-  }
+  if (CHECK(analogContinuousReadSumCount(results, 1000)))
+    processAdcResults(results);
 }
