@@ -44,7 +44,7 @@ struct Pin {
   uint16_t calibrateNext() {
     switch (poly.size()) {
     case 0:
-      return 512;
+      return reversed ? 192 : 832;
     case 1:
       return 0;
     case 2:
